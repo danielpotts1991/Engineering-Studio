@@ -9,6 +9,7 @@ const TEMPLATE_FILE_TYPE = 'hvac-studio-report-template';
 type Props = {
   rooms: Room[];
   feetPerPoint: number | null;
+  feetPerPointOf?: (r: Room) => number | null;  // per-room scale when rooms come from several sheets
   env: Env;
   projectName: string;
   saved: ReportTemplate[];                       // user report layouts (kept in this browser)
@@ -25,7 +26,7 @@ function download(content: string, name: string, type: string) {
 }
 const safeFile = (s: string) => s.replace(/[\\/:*?"<>|]+/g, '-').trim() || 'report';
 
-export default function Reports({ rooms, feetPerPoint, env, projectName, saved, setSaved, templateName, onClose, initialId }: Props) {
+export default function Reports({ rooms, feetPerPoint, feetPerPointOf, env, projectName, saved, setSaved, templateName, onClose, initialId }: Props) {
   const all = [...BUILTIN_REPORTS, ...saved];
   const [currentId, setCurrentId] = useState(initialId === SCHEDULE_REPORT_ID || all.some(t => t.id === initialId) ? initialId! : all[0].id);
   const schedule = currentId === SCHEDULE_REPORT_ID; // per fixture type, not per room
@@ -39,12 +40,13 @@ export default function Reports({ rooms, feetPerPoint, env, projectName, saved, 
   const dirty = cols.join() !== current.columns.join() || byEquip !== !!current.byEquip;
 
   const columns = cols.map(id => COLUMN_BY_ID.get(id)).filter(c => !!c);
-  const rows = rooms.map(r => ({ r, m: metrics(r, feetPerPoint, env) }));
+  const fpp = (r: Room) => feetPerPointOf ? feetPerPointOf(r) : feetPerPoint;
+  const rows = rooms.map(r => ({ r, m: metrics(r, fpp(r), env) }));
   const ctx = { tpl: templateName };
   // One row per unit: per-unit columns are worked out for that unit alone; room columns span the room's units.
   type Line = { r: Room; m: Metrics; key: string; unit: { r: Room; m: Metrics } | null; first: boolean; span: number };
   const lines: Line[] = rows.flatMap(({ r, m }): Line[] => !byEquip || r.equipment.length < 1 ? [{ r, m, key: r.id, unit: null, first: true, span: 1 }]
-    : r.equipment.map((e, i) => { const ur = { ...r, equipment: [e] }; return { r, m, key: e.id, unit: { r: ur, m: metrics(ur, feetPerPoint, env) }, first: i === 0, span: r.equipment.length }; }));
+    : r.equipment.map((e, i) => { const ur = { ...r, equipment: [e] }; return { r, m, key: e.id, unit: { r: ur, m: metrics(ur, fpp(r), env) }, first: i === 0, span: r.equipment.length }; }));
   const lines_ = lines;
   const cellValue = (l: Line, c: Column) => c.perEquip && byEquip ? (l.unit ? c.get(l.unit.r, l.unit.m, ctx) : null) : l.first ? c.get(l.r, l.m, ctx) : null;
   const unitCount = rows.reduce((t, { r }) => t + r.equipment.length, 0);
@@ -216,7 +218,7 @@ export default function Reports({ rooms, feetPerPoint, env, projectName, saved, 
         </> : <>
         <div className="hvac-report-title">
           <div><h2>{current.name} Report</h2><span>{projectName.replace(/\.hvac\.json$|\.json$/, '')}</span></div>
-          <span>{byEquip ? `${unitCount} unit${unitCount === 1 ? '' : 's'} in ${rows.length} room${rows.length === 1 ? '' : 's'} · ` : ''}{new Date().toLocaleDateString()}{feetPerPoint === null ? ' · drawing not scaled: areas unavailable' : ''}</span>
+          <span>{byEquip ? `${unitCount} unit${unitCount === 1 ? '' : 's'} in ${rows.length} room${rows.length === 1 ? '' : 's'} · ` : ''}{new Date().toLocaleDateString()}{(feetPerPointOf ? rooms.some(r => feetPerPointOf(r) === null) : feetPerPoint === null) ? ' · drawing not scaled: areas unavailable' : ''}</span>
         </div>
         {!rooms.length ? <p className="hvac-muted">No rooms in this project yet.</p> :
           <table className="hvac-report-table">

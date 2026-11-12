@@ -46,7 +46,10 @@ src/
 
 ## Plan
 
-1. Core: sheet manager (add / remove / replace / reorder PDF sheets, scale per sheet), PDFs stored outside the JSON, shared canvas pulled out of App.tsx, reducer-style undo. HVAC + plumbing work exactly as before.
+1. Core, in parts. HVAC + plumbing must work exactly as before after each part.
+   - 1a (done): sheets. `src/core/sheets.ts`. A project holds many sheets (one PDF page each, several sheets can share a PDF), each with its own scale, rooms, undo history and zoom. The active sheet is edited through App's existing working state (`pdf, pageNumber, scale, customFeetPerPoint, rooms`); `allSheets()` merges it back. Project file version 2 (`app: 'engineering-studio'`); version 1 HVAC Studio files open as one sheet and are never overwritten in place. Reports and CSV cover every sheet (each room at its own sheet's scale); the room list, room table and totals show the active sheet.
+   - 1b: pull the canvas (PDF render, zoom/pan, snapping, calibration) out of App.tsx into `src/core/`.
+   - 1c: reducer-style project store with one undo stack; PDFs stored outside the project JSON if file size becomes a problem.
 2. Pressurization module: port the pressure solver and door leakage math; doors sit on a room edge and find the rooms on each side (gap tolerance ~12 in, adjustable), and move when that wall moves.
 3. Static pressure module: port `engine/` (airflow, network, library) as-is; rebuild the duct tool on the shared canvas; system type per duct system instead of per project.
 

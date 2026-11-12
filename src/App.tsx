@@ -23,11 +23,19 @@ import { labelPoint, labelObstacle, equipRadiusFt, equipObstacles, freeSpot, pla
 import { type Tool, type Action, type AppSettings, ACTIONS, DEFAULT_SHORTCUTS, RESERVED_KEYS, keyLabel, DEFAULT_EQUIP_OPACITY, SETTINGS_KEY, loadSettings, isTyping } from './settings';
 import { NumField, Section, SidePanel, IconBtn } from './ui';
 import { MODULES, moduleById, type ModuleCtx, type ModuleId } from './modules';
+import { type SheetData, type SavedPdf, sheetFeetPerPoint, sheetNameFor, parsePages } from './core/sheets';
+import { Plus, FilePlus, Pencil } from 'lucide-react';
 
 type EdgeSel = { ring: number; index: number }; // ring -1 = room outline, k = cutout k
 const bytesToBase64=(bytes:Uint8Array)=>{let out='';for(let i=0;i<bytes.length;i+=8192)out+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(out);};
 const base64ToBytes=(b64:string)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
-type ProjectFile={version:1;pdfName:string;pdfBase64:string|null;pageNumber:number;scale:string;customFeetPerPoint:number|null;altitudeFt?:number;peopleSensible?:number;library?:LibItem[];fixtureTypes?:FixtureType[];rooms:Room[]};
+// Version 1: HVAC Studio files (one PDF, one page). Still opened; always saved as version 2.
+type ProjectFileV1={version:1;pdfName:string;pdfBase64:string|null;pageNumber:number;scale:string;customFeetPerPoint:number|null;altitudeFt?:number;peopleSensible?:number;library?:LibItem[];fixtureTypes?:FixtureType[];rooms:Room[]};
+// Version 2: Engineering Studio. Any number of sheets; each PDF is stored once even if several sheets use its pages.
+type ProjectFile={version:2;app:'engineering-studio';pdfs:SavedPdf[];sheets:SheetData[];activeSheetId:string|null;altitudeFt?:number;peopleSensible?:number;library?:LibItem[];fixtureTypes?:FixtureType[]};
+type StoredPdf={name:string;bytes:Uint8Array<ArrayBuffer>;doc:pdfjsLib.PDFDocumentProxy|null};
+// What counts as an unsaved change (switching sheets or zooming doesn't).
+const snapshotOf=(sheets:SheetData[],altitudeFt:number,peopleSensible:number,library:LibItem[],fixtureTypes:FixtureType[])=>JSON.stringify({sheets,altitudeFt,peopleSensible,library,fixtureTypes});
 type WritableHandle={name:string;createWritable:()=>Promise<{write:(data:string)=>Promise<void>;close:()=>Promise<void>}>};
 type FilePickerWindow=Window & {showSaveFilePicker?:(opts:object)=>Promise<WritableHandle>;showOpenFilePicker?:(opts:object)=>Promise<Array<{getFile:()=>Promise<File>;name:string}>>};
 export default function App(){
@@ -35,7 +43,7 @@ export default function App(){
   const [pdfName,setPdfName]=useState('No drawing loaded');
   const pdfBytesRef=useRef<Uint8Array<ArrayBuffer>|null>(null);
   const projectHandleRef=useRef<WritableHandle|null>(null);
-  const [projectName,setProjectName]=useState('Untitled.hvac.json');
+  const [projectName,setProjectName]=useState('Untitled.es.json');
   const [dirty,setDirty]=useState(false);
   const lastSnapshotRef=useRef('');
   const initializedRef=useRef(false);
@@ -46,6 +54,17 @@ export default function App(){
   const [orthogonal,setOrthogonal]=useState(true);
   const [scale,setScale]=useState('1/8');
   const [customFeetPerPoint,setCustomFeetPerPoint]=useState<number|null>(null);
+  // ---- Sheets ----
+  // The active sheet is edited through the working state above and below (pdf, pageNumber, scale,
+  // customFeetPerPoint, rooms), exactly as before sheets existed. `sheets` holds every sheet; its
+  // entry for the active sheet is refreshed from the working state when switching or saving (allSheets()).
+  const [sheets,setSheets]=useState<SheetData[]>([]);
+  const [activeSheetId,setActiveSheetId]=useState<string|null>(null);
+  const [activePdfId,setActivePdfId]=useState<string|null>(null);
+  const pdfStoreRef=useRef(new Map<string,StoredPdf>());
+  const sheetHistoryRef=useRef(new Map<string,Room[][]>());              // undo history kept per sheet
+  const sheetViewRef=useRef(new Map<string,{zoom:number;x:number;y:number}>()); // zoom/pan kept per sheet
+  const fitPendingRef=useRef(false);
   // Project-wide values (saved in the project file, edited in Settings > Project).
   const [altitudeFt,setAltitudeFt]=useState(0);         // site altitude: corrects the 1.08 sensible factor
   const [peopleSensible,setPeopleSensible]=useState(250); // BTU/h per person
@@ -231,7 +250,7 @@ export default function App(){
     let cancelled=false;let task:ReturnType<pdfjsLib.PDFPageProxy['render']>|undefined;
     pageRef.current=null;if(detailRef.current)detailRef.current.style.display='none';
     (async()=>{const page=await pdf.getPage(pageNumber);const vp=page.getViewport({scale:1});if(cancelled)return;
-      setPageSize({width:vp.width,height:vp.height});const canvas=canvasRef.current;if(!canvas)return;
+      setPageSize({width:vp.width,height:vp.height});if(fitPendingRef.current){fitPendingRef.current=false;fitPage({width:vp.width,height:vp.height});}const canvas=canvasRef.current;if(!canvas)return;
       const ratio=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(vp.width*ratio);canvas.height=Math.round(vp.height*ratio);
       canvas.style.width=`${vp.width}px`;canvas.style.height=`${vp.height}px`;
       const ctx=canvas.getContext('2d');if(!ctx)return;
@@ -270,12 +289,13 @@ export default function App(){
     Object.assign(out.style,{display:'block',left:`${x0}px`,top:`${y0}px`,width:`${w}px`,height:`${h}px`});
   }
 
-  const snapshot=JSON.stringify({pdfName,pageNumber,scale,customFeetPerPoint,altitudeFt,peopleSensible,library,fixtureTypes,rooms});
+  const snapshot=snapshotOf(allSheets(),altitudeFt,peopleSensible,library,fixtureTypes);
   useEffect(()=>{
     if(!initializedRef.current){initializedRef.current=true;lastSnapshotRef.current=snapshot;return;}
     setDirty(snapshot!==lastSnapshotRef.current);
   },[snapshot]);
-  useEffect(()=>{if(!dirty)return;try{localStorage.setItem('hvac-studio-recovery',JSON.stringify({version:1,pdfName,pageNumber,scale,customFeetPerPoint,altitudeFt,peopleSensible,library,fixtureTypes,rooms}));}catch{/* storage unavailable */}},[dirty,snapshot]);
+  // Crash recovery copy of the drawing data (not the PDFs).
+  useEffect(()=>{if(!dirty)return;try{localStorage.setItem('engineering-studio-recovery',JSON.stringify({version:2,activeSheetId,sheets:allSheets(),altitudeFt,peopleSensible,library,fixtureTypes}));}catch{/* storage full or unavailable */}},[dirty,snapshot]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(()=>()=>{if(zoomLabelTimerRef.current!==null)clearTimeout(zoomLabelTimerRef.current);},[]);
   useEffect(()=>{const warn=(e:BeforeUnloadEvent)=>{if(dirty){e.preventDefault();e.returnValue='';}};window.addEventListener('beforeunload',warn);return()=>window.removeEventListener('beforeunload',warn);},[dirty]);
   useEffect(()=>{const onKey=(e:KeyboardEvent)=>{
@@ -369,54 +389,155 @@ export default function App(){
     window.addEventListener('keyup',up);window.addEventListener('blur',reset);
     return()=>{window.removeEventListener('keyup',up);window.removeEventListener('blur',reset);};
   },[]);
-  async function importPdf(e:ChangeEvent<HTMLInputElement>){const file=e.target.files?.[0];if(!file)return;
-    if(rooms.length&&!window.confirm('Start a new takeoff from this PDF? This clears the current rooms.\n\nTo keep your rooms and just swap the drawing, cancel and use "Replace background" instead.')){e.target.value='';return;}
-    try{const data=new Uint8Array(await file.arrayBuffer());const doc=await pdfjsLib.getDocument({data:data.slice()}).promise;
-      pdfBytesRef.current=data.slice() as Uint8Array<ArrayBuffer>;projectHandleRef.current=null;setProjectName('Untitled.hvac.json');
-      historyRef.current=[];setPdf(doc);setPdfName(file.name);setPageNumber(1);setRooms([]);setDraft([]);setSelectedId(null);setCalPoints([]);setScale('1/8');setCustomFeetPerPoint(null);setTool('select');setZoom(1);zoomRef.current=1;offsetRef.current={x:20,y:20};
-      setMessage(`PDF loaded. Set the drawing scale, then press ${keyLabel(settings.shortcuts.draw)} to draw rooms along inside wall faces.`);
-    }catch(err){console.error(err);setMessage('Unable to open PDF.');}e.target.value='';}
-  // Swap the background drawing but keep every room, the scale and the project file.
+  // ---- Sheets ----
+  // Every sheet, with the active one brought up to date from the working state.
+  function allSheets():SheetData[]{
+    return sheets.map(s=>s.id===activeSheetId?{...s,pdfId:activePdfId,page:pageNumber,scale,customFeetPerPoint,rooms}:s);
+  }
+  async function pdfDoc(id:string|null){
+    const p=id?pdfStoreRef.current.get(id):undefined;if(!p)return null;
+    if(!p.doc)p.doc=await pdfjsLib.getDocument({data:p.bytes.slice()}).promise; // pdf.js takes ownership of the buffer: give it a copy
+    return p.doc;
+  }
+  async function storePdf(file:File){
+    const data=new Uint8Array(await file.arrayBuffer());const doc=await pdfjsLib.getDocument({data:data.slice()}).promise;
+    const id=newId();pdfStoreRef.current.set(id,{name:file.name,bytes:data.slice() as Uint8Array<ArrayBuffer>,doc});
+    return {id,doc};
+  }
+  // Show a sheet: load its PDF page, scale, rooms, undo history and zoom/pan into the working state.
+  async function showSheet(s:SheetData|null,list:SheetData[],saveCurrent=true){
+    if(saveCurrent&&activeSheetId){sheetHistoryRef.current.set(activeSheetId,historyRef.current);sheetViewRef.current.set(activeSheetId,{zoom:zoomRef.current,...offsetRef.current});}
+    const doc=s?await pdfDoc(s.pdfId):null;
+    const stored=s?.pdfId?pdfStoreRef.current.get(s.pdfId):undefined;
+    setSheets(list);setActiveSheetId(s?.id??null);setActivePdfId(s?.pdfId??null);
+    pdfBytesRef.current=stored?.bytes??null;setPdf(doc);setPdfName(stored?.name??'No drawing loaded');
+    setPageNumber(s?.page??1);setScale(s?.scale??'1/8');setCustomFeetPerPoint(s?.customFeetPerPoint??null);setRooms(s?.rooms??[]);
+    historyRef.current=s?sheetHistoryRef.current.get(s.id)??[]:[];
+    setDraft([]);draftRef.current=[];setSelectedId(null);setCalPoints([]);setTool('select');
+    const view=s?sheetViewRef.current.get(s.id):undefined;
+    zoomRef.current=view?.zoom??1;offsetRef.current=view?{x:view.x,y:view.y}:{x:20,y:20};setZoom(zoomRef.current);
+    fitPendingRef.current=!view&&!!s; // first visit: fit the page once its size is known (page render effect)
+  }
+  function switchSheet(id:string){if(id!==activeSheetId)void showSheet(allSheets().find(s=>s.id===id)??null,allSheets());}
+  // Ask which pages of a multi-page PDF to add. Returns null if cancelled.
+  function askPages(fileName:string,numPages:number):number[]|null{
+    if(numPages===1)return [1];
+    for(let text:string|null='1';;){
+      text=window.prompt(`${fileName} has ${numPages} pages. Which pages should become sheets?\nExamples: 3   or   1-4, 7   or   all`,text);
+      if(text===null)return null;
+      const pages=parsePages(text,numPages);if(pages)return pages;
+      window.alert(`Couldn't read "${text}". Use page numbers between 1 and ${numPages}, like 1-4, 7 or all.`);
+    }
+  }
+  // New sheets from pages of a stored PDF, inserted after the active sheet; the first one is shown.
+  function addSheetsFrom(pdfId:string,fileName:string,numPages:number,pages:number[]){
+    const cur=allSheets(),at=cur.findIndex(s=>s.id===activeSheetId)+1||cur.length;
+    const base=cur.find(s=>s.id===activeSheetId); // new sheets start with the current scale: sets are usually drawn at one scale
+    const added:SheetData[]=pages.map(p=>({id:newId(),name:sheetNameFor(fileName,p,numPages),pdfId,page:p,scale:base?.scale??'1/8',customFeetPerPoint:base?.customFeetPerPoint??null,rooms:[]}));
+    void showSheet(added[0],[...cur.slice(0,at),...added,...cur.slice(at)]);
+    setMessage(`${added.length===1?`Sheet "${added[0].name}"`:`${added.length} sheets`} added. Check the scale${added.length>1?' on each':''}, then press ${keyLabel(settings.shortcuts.draw)} to draw rooms along inside wall faces.`);
+  }
+  async function importPdf(e:ChangeEvent<HTMLInputElement>){const file=e.target.files?.[0];e.target.value='';if(!file)return;
+    try{const {id,doc}=await storePdf(file);
+      const pages=askPages(file.name,doc.numPages);if(!pages){pdfStoreRef.current.delete(id);return;}
+      addSheetsFrom(id,file.name,doc.numPages,pages);
+    }catch(err){console.error(err);setMessage('Unable to open PDF.');}}
+  // More pages of the active sheet's PDF, without loading the file again.
+  function addPagesOfCurrentPdf(){
+    if(!pdf||!activePdfId)return;
+    const pages=askPages(pdfName,pdf.numPages);if(pages)addSheetsFrom(activePdfId,pdfName,pdf.numPages,pages);
+  }
+  // Swap the active sheet's background drawing but keep its rooms and scale.
   async function replacePdf(e:ChangeEvent<HTMLInputElement>){const file=e.target.files?.[0];e.target.value='';if(!file)return;
-    try{const data=new Uint8Array(await file.arrayBuffer());const doc=await pdfjsLib.getDocument({data:data.slice()}).promise;
-      const page=pageNumber<=doc.numPages?pageNumber:1,vp=(await doc.getPage(page)).getViewport({scale:1});
+    try{const {id,doc}=await storePdf(file);
+      let page=pageNumber<=doc.numPages?pageNumber:1;
+      if(doc.numPages>1){const pick=window.prompt(`${file.name} has ${doc.numPages} pages. Which page replaces this sheet's background?`,String(page));
+        const n=Number(pick);if(pick===null||!Number.isInteger(n)||n<1||n>doc.numPages){pdfStoreRef.current.delete(id);if(pick!==null)setMessage('No valid page chosen. The current background was kept.');return;}page=n;}
+      const vp=(await doc.getPage(page)).getViewport({scale:1});
       const sameSize=Math.abs(vp.width-pageSize.width)<1&&Math.abs(vp.height-pageSize.height)<1;
-      pdfBytesRef.current=data.slice() as Uint8Array<ArrayBuffer>;setPdf(doc);setPdfName(file.name);setPageNumber(page);
+      pdfBytesRef.current=pdfStoreRef.current.get(id)!.bytes;setActivePdfId(id);setPdf(doc);setPdfName(file.name);setPageNumber(page);
       setMessage(`Background replaced with ${file.name}${doc.numPages>1?` (page ${page})`:''}. Rooms kept.${sameSize?'':' The new sheet is a different size.'} If the plan shifted, press Ctrl/Cmd+A, then drag or use the arrow keys to realign.${scale==='custom'?' Check the custom calibration still matches.':''}`);
     }catch(err){console.error(err);setMessage('Unable to open that PDF. The current background was kept.');}}
-  function projectData():ProjectFile{return {version:1,pdfName,pdfBase64:pdfBytesRef.current?bytesToBase64(pdfBytesRef.current):null,pageNumber,scale,customFeetPerPoint,altitudeFt,peopleSensible,library,fixtureTypes,rooms};}
+  function renameSheet(id:string){
+    const s=sheets.find(x=>x.id===id);if(!s)return;
+    const name=window.prompt('Sheet name:',s.name);if(!name?.trim())return;
+    setSheets(v=>v.map(x=>x.id===id?{...x,name:name.trim()}:x));
+  }
+  function moveSheet(id:string,by:-1|1){
+    setSheets(v=>{const i=v.findIndex(x=>x.id===id),j=i+by;if(i<0||j<0||j>=v.length)return v;const n=v.slice();[n[i],n[j]]=[n[j],n[i]];return n;});
+  }
+  function removeSheet(id:string){
+    const cur=allSheets(),i=cur.findIndex(s=>s.id===id),s=cur[i];if(!s)return;
+    if(!window.confirm(`Remove sheet "${s.name}"${s.rooms.length?` and its ${s.rooms.length} room${s.rooms.length===1?'':'s'}`:''}? This can't be undone.`))return;
+    const rest=cur.filter(x=>x.id!==id);sheetHistoryRef.current.delete(id);sheetViewRef.current.delete(id);
+    if(id===activeSheetId){historyRef.current=[];void showSheet(rest[Math.min(i,rest.length-1)]??null,rest).then(()=>{sheetHistoryRef.current.delete(id);sheetViewRef.current.delete(id);});}
+    else setSheets(rest);
+    setMessage(`Sheet "${s.name}" removed.`);
+  }
+  function newProject(){
+    if(dirty&&!window.confirm('Start a new project? Unsaved changes to this project will be lost.'))return;
+    pdfStoreRef.current.clear();sheetHistoryRef.current.clear();sheetViewRef.current.clear();projectHandleRef.current=null;
+    historyRef.current=[];setActiveSheetId(null);setZoom(1);zoomRef.current=1;offsetRef.current={x:20,y:20};
+    setSheets([]);setActivePdfId(null);pdfBytesRef.current=null;setPdf(null);setPdfName('No drawing loaded');setPageNumber(1);setScale('1/8');setCustomFeetPerPoint(null);setRooms([]);
+    setDraft([]);draftRef.current=[];setSelectedId(null);setCalPoints([]);setTool('select');
+    setAltitudeFt(0);setPeopleSensible(250);setLibrary([]);setFixtureTypes([]);setProjectName('Untitled.es.json');
+    lastSnapshotRef.current=snapshotOf([],0,250,[],[]);setDirty(false);
+    setMessage('New project. Add a PDF to begin.');
+  }
+  function projectData():ProjectFile{
+    const list=allSheets(),used=new Set(list.map(s=>s.pdfId).filter((x):x is string=>!!x));
+    const pdfs:SavedPdf[]=[...used].flatMap(id=>{const p=pdfStoreRef.current.get(id);return p?[{id,name:p.name,base64:bytesToBase64(p.bytes)}]:[];});
+    return {version:2,app:'engineering-studio',pdfs,sheets:list,activeSheetId,altitudeFt,peopleSensible,library,fixtureTypes};
+  }
   function downloadProject(content:string,name:string){const url=URL.createObjectURL(new Blob([content],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);}
   async function saveProject(saveAs=false){
     const content=JSON.stringify(projectData());
     try{
       let handle=saveAs?null:projectHandleRef.current;
       if(!handle){const picker=(window as FilePickerWindow).showSaveFilePicker;
-        if(picker){handle=await picker({suggestedName:projectName,types:[{description:'HVAC Studio Project',accept:{'application/json':['.json']}}]});projectHandleRef.current=handle;setProjectName(handle.name);}
+        if(picker){handle=await picker({suggestedName:projectName,types:[{description:'Engineering Studio Project',accept:{'application/json':['.json']}}]});projectHandleRef.current=handle;setProjectName(handle.name);}
         else{downloadProject(content,projectName);setMessage('Project downloaded. This browser does not support direct overwrite; use desktop Chrome for Save to same file.');return;}
       }
       const writable=await handle.createWritable();await writable.write(content);await writable.close();
-      lastSnapshotRef.current=JSON.stringify({pdfName,pageNumber,scale,customFeetPerPoint,altitudeFt,peopleSensible,library,fixtureTypes,rooms});setDirty(false);
+      lastSnapshotRef.current=snapshotOf(allSheets(),altitudeFt,peopleSensible,library,fixtureTypes);setDirty(false);
       setMessage(`Saved ${handle.name}`);
     }catch(err){if((err as Error).name!=='AbortError'){console.error(err);setMessage('Save failed. Please try Save As.');}}
   }
   async function loadProject(file:File,handle:WritableHandle|null){
-    try{const parsed=JSON.parse(await file.text()) as ProjectFile;
-      if(parsed.version!==1||!Array.isArray(parsed.rooms))throw new Error('Invalid project file');
-      let doc:pdfjsLib.PDFDocumentProxy|null=null;let bytes:Uint8Array<ArrayBuffer>|null=null;
-      if(parsed.pdfBase64){bytes=base64ToBytes(parsed.pdfBase64) as Uint8Array<ArrayBuffer>;doc=await pdfjsLib.getDocument({data:bytes.slice()}).promise;}
-      historyRef.current=[];pdfBytesRef.current=bytes;setPdf(doc);setPdfName(parsed.pdfName||'No PDF');setPageNumber(parsed.pageNumber||1);
-      setScale(parsed.scale||'1/8');setCustomFeetPerPoint(parsed.customFeetPerPoint??null);const fpp=(parsed.scale||'1/8')==='custom'?parsed.customFeetPerPoint??null:scaleFeetPerPoint(parsed.scale||'1/8');
-      const loadedRooms=placeMissingEquipment(parsed.rooms.map(normalizeRoom),fpp?1/fpp:9);setRooms(loadedRooms);setAltitudeFt(parsed.altitudeFt??0);
+    try{const parsed=JSON.parse(await file.text()) as ProjectFile|ProjectFileV1;
+      let pdfs:SavedPdf[],list:SheetData[],active:string|null;
+      if(parsed.version===1){
+        // HVAC Studio file: becomes one sheet. It is never written back in place (see below).
+        if(!Array.isArray(parsed.rooms))throw new Error('Invalid project file');
+        const pdfId=parsed.pdfBase64?newId():null;
+        pdfs=pdfId?[{id:pdfId,name:parsed.pdfName||'Drawing.pdf',base64:parsed.pdfBase64!}]:[];
+        list=[{id:newId(),name:(parsed.pdfName||'Sheet 1').replace(/\.pdf$/i,''),pdfId,page:parsed.pageNumber||1,scale:parsed.scale||'1/8',customFeetPerPoint:parsed.customFeetPerPoint??null,rooms:parsed.rooms}];
+        active=list[0].id;
+      }else if(parsed.version===2&&Array.isArray(parsed.sheets)&&Array.isArray(parsed.pdfs)){
+        pdfs=parsed.pdfs;list=parsed.sheets;active=parsed.activeSheetId;
+      }else throw new Error('Invalid project file');
+      // Rooms: same normalizing as before sheets, per sheet with that sheet's scale.
+      list=list.map(sh=>{const fpp=sheetFeetPerPoint({scale:sh.scale||'1/8',customFeetPerPoint:sh.customFeetPerPoint??null});
+        return {...sh,scale:sh.scale||'1/8',customFeetPerPoint:sh.customFeetPerPoint??null,page:sh.page||1,rooms:placeMissingEquipment((sh.rooms??[]).map(normalizeRoom),fpp?1/fpp:9)};});
+      const store=new Map<string,StoredPdf>();
+      for(const p of pdfs)store.set(p.id,{name:p.name,bytes:base64ToBytes(p.base64) as Uint8Array<ArrayBuffer>,doc:null});
+      const firstRooms=(parsed.version===1?parsed.rooms:parsed.sheets.flatMap(sh=>sh.rooms??[]))[0] as {peopleSensible?:number}|undefined;
       // People heat used to be stored per room; take it from the first room in older files.
-      const ps=parsed.peopleSensible??(parsed.rooms[0] as {peopleSensible?:number}|undefined)?.peopleSensible??250,lib=normalizeLibrary(parsed.library);
-      const ft=normalizeFixtureTypes(parsed.fixtureTypes);
-      setPeopleSensible(ps);setLibrary(lib);setFixtureTypes(ft);setSelectedId(null);setDraft([]);setTool('select');setZoom(1);zoomRef.current=1;offsetRef.current={x:20,y:20};
-      projectHandleRef.current=handle;setProjectName(file.name);lastSnapshotRef.current=JSON.stringify({pdfName:parsed.pdfName||'No PDF',pageNumber:parsed.pageNumber||1,scale:parsed.scale||'1/8',customFeetPerPoint:parsed.customFeetPerPoint??null,altitudeFt:parsed.altitudeFt??0,peopleSensible:ps,library:lib,fixtureTypes:ft,rooms:loadedRooms});setDirty(false);
-      setMessage(`Opened ${file.name}. Cmd+S saves changes to this project${handle?' directly':''}.`);
-    }catch(err){console.error(err);setMessage('Could not open this HVAC Studio project.');}
+      const ps=parsed.peopleSensible??firstRooms?.peopleSensible??250,lib=normalizeLibrary(parsed.library);
+      const ft=normalizeFixtureTypes(parsed.fixtureTypes);const alt=parsed.altitudeFt??0;
+      pdfStoreRef.current=store;sheetHistoryRef.current.clear();sheetViewRef.current.clear();
+      setAltitudeFt(alt);setPeopleSensible(ps);setLibrary(lib);setFixtureTypes(ft);
+      await showSheet(list.find(sh=>sh.id===active)??list[0]??null,list,false);
+      // An HVAC Studio (version 1) file is not overwritten: the first save asks for a new file name.
+      const v1=parsed.version===1;
+      projectHandleRef.current=v1?null:handle;setProjectName(v1?file.name.replace(/(\.hvac)?\.json$/i,'')+'.es.json':file.name);
+      lastSnapshotRef.current=snapshotOf(list,alt,ps,lib,ft);setDirty(false);
+      setMessage(v1?`Opened HVAC Studio project ${file.name} as one sheet. Saving creates a new Engineering Studio file; the original is left unchanged.`
+        :`Opened ${file.name} (${list.length} sheet${list.length===1?'':'s'}). Cmd+S saves changes to this project${handle?' directly':''}.`);
+    }catch(err){console.error(err);setMessage('Could not open this project.');}
   }
   async function openProject(){try{const picker=(window as FilePickerWindow).showOpenFilePicker;
-    if(picker){const [handle]=await picker({types:[{description:'HVAC Studio Project',accept:{'application/json':['.json']}}]});if(handle)await loadProject(await handle.getFile(),handle as unknown as WritableHandle);}
+    if(picker){const [handle]=await picker({types:[{description:'Engineering Studio Project',accept:{'application/json':['.json']}}]});if(handle)await loadProject(await handle.getFile(),handle as unknown as WritableHandle);}
     else document.getElementById('hvac-project-input')?.click();
   }catch(err){if((err as Error).name!=='AbortError')setMessage('Could not open project.');}}
   function pointFromEvent(e:ReactPointerEvent<SVGSVGElement>):Point {const svg=svgRef.current!;const p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;const matrix=svg.getScreenCTM();if(!matrix)return {x:0,y:0};
@@ -945,18 +1066,19 @@ export default function App(){
     updateViewport();
   }
   function endPan(){if(!panRef.current)return;panRef.current=null;setPanning(false);}
-  function fitPage(){
+  function fitPage(size=pageSize){
     const viewport=scrollRef.current;if(!viewport)return;
-    const z=Math.max(.15,Math.min(4,Math.min((viewport.clientWidth-48)/pageSize.width,(viewport.clientHeight-48)/pageSize.height)));
+    const z=Math.max(.15,Math.min(4,Math.min((viewport.clientWidth-48)/size.width,(viewport.clientHeight-48)/size.height)));
     zoomRef.current=z;
-    offsetRef.current={x:(viewport.clientWidth-pageSize.width*z)/2,y:(viewport.clientHeight-pageSize.height*z)/2};
+    offsetRef.current={x:(viewport.clientWidth-size.width*z)/2,y:(viewport.clientHeight-size.height*z)/2};
     updateViewport();updateZoomLabel();
   }
   function updateRoom(changes:Partial<Room>,id=selectedId){setRooms(v=>v.map(r=>r.id===id?{...r,...changes}:r));}
   function exportCsv(){
     const raw=(v:number|string|null,dec=1)=>v===null?'':typeof v==='number'?Number(v.toFixed(dec)):v;
     const rows:(string|number)[][]=[[...COLUMNS.map(c=>c.label),'Load Breakdown'],
-      ...rooms.map(r=>{const m=mOf(r);return [...COLUMNS.map(c=>raw(c.get(r,m,{tpl:templateName}),c.dec??1)),r.loads.map(l=>`${l.name}: ${tidy(l.value)} ${l.unit}`).join('; ')];})];
+      // every sheet, each room measured at its own sheet's scale
+      ...allSheets().flatMap(sh=>sh.rooms.map(r=>{const m=metrics(r,sheetFeetPerPoint(sh),env);return [...COLUMNS.map(c=>raw(c.get(r,m,{tpl:templateName}),c.dec??1)),r.loads.map(l=>`${l.name}: ${tidy(l.value)} ${l.unit}`).join('; ')];}))];
     const csv=rows.map(row=>row.map(v=>`"${String(v).replaceAll('"','""')}"`).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='hvac-room-takeoff.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   }
   const edgeRing=selected&&selectedEdge?(selectedEdge.ring<0?selected.points:cutoutsOf(selected)[selectedEdge.ring]):null;
@@ -967,20 +1089,21 @@ export default function App(){
   const previewPoint=draft.length&&hover?(orthogonal?snapDirection(draft[draft.length-1],hover):hover):null;
   const rectPreview=rectStart&&rectEnd?[{x:rectStart.x,y:rectStart.y},{x:rectEnd.x,y:rectStart.y},{x:rectEnd.x,y:rectEnd.y},{x:rectStart.x,y:rectEnd.y}]:null;
   return <div className="hvac-app">
-    <header className="hvac-header"><div><strong>HVAC Studio</strong><small>Room takeoff & engineering workspace</small></div><small>{projectName}{dirty?" • Unsaved changes":""} · {pdfName}</small></header>
+    <header className="hvac-header"><div><strong>Engineering Studio</strong><small>Takeoffs & engineering calculations</small></div><small>{projectName}{dirty?" • Unsaved changes":""} · {pdfName}</small></header>
     <div className="hvac-toolbar">
       <input id="hvac-project-input" type="file" accept=".json,application/json" hidden onChange={e=>{const f=e.target.files?.[0];if(f)void loadProject(f,null);e.target.value='';}}/>
       <input ref={fileRef} type="file" accept=".pdf,application/pdf" onChange={importPdf} hidden/>
       <div className="hvac-group"><span className="hvac-group-label">Project</span><div className="hvac-group-items">
-        <IconBtn tip="Open project" onClick={()=>void openProject()}><FolderOpen size={17}/></IconBtn>
+        <IconBtn tip="New project" onClick={newProject}><FilePlus size={17}/></IconBtn>
+        <IconBtn tip="Open project (Engineering Studio or HVAC Studio file)" onClick={()=>void openProject()}><FolderOpen size={17}/></IconBtn>
         <IconBtn tip="Save (Ctrl/Cmd+S)" onClick={()=>void saveProject()}><Save size={17}/></IconBtn>
         <IconBtn tip="Save as…" onClick={()=>void saveProject(true)}><SaveAll size={17}/></IconBtn>
         <IconBtn tip="Libraries: heat-generating equipment, plumbing fixtures" active={libraryOpen!==false} onClick={()=>setLibraryOpen({tab:'heat',item:null})}><Package size={17}/></IconBtn>
       </div></div>
       <div className="hvac-group"><span className="hvac-group-label">PDF</span><div className="hvac-group-items">
-        <IconBtn tip="Import PDF (new takeoff)" onClick={()=>fileRef.current?.click()}><Upload size={17}/></IconBtn>
+        <IconBtn tip="Add sheets from a PDF" onClick={()=>fileRef.current?.click()}><Upload size={17}/></IconBtn>
         <input ref={replaceRef} type="file" accept=".pdf,application/pdf" onChange={replacePdf} hidden/>
-        <IconBtn tip="Replace background PDF (keeps rooms)" disabled={!pdf} onClick={()=>replaceRef.current?.click()}><RefreshCw size={17}/></IconBtn>
+        <IconBtn tip="Replace this sheet's PDF (keeps its rooms)" disabled={!pdf} onClick={()=>replaceRef.current?.click()}><RefreshCw size={17}/></IconBtn>
         <select className="hvac-scale-select" title="Drawing scale" aria-label="Drawing scale" value={scale} onChange={e=>{const v=e.target.value;setScale(v);e.currentTarget.blur();if(v==='custom')switchTool('calibrate');}}>{scales.map(([value,label])=><option key={value} value={value}>{label}</option>)}</select>
         <IconBtn tip={`Calibrate scale (${sc('calibrate')})`} active={tool==='calibrate'} onClick={()=>switchTool('calibrate')}><Ruler size={17}/></IconBtn>
         <div className="hvac-layers-wrap">
@@ -996,7 +1119,7 @@ export default function App(){
         <IconBtn tip="Zoom out" onClick={()=>zoomAt(Math.max(.15,zoom/1.25))}><ZoomOut size={17}/></IconBtn>
         <span className="hvac-zoom">{Math.round(zoom*100)}%</span>
         <IconBtn tip="Zoom in" onClick={()=>zoomAt(Math.min(8,zoom*1.25))}><ZoomIn size={17}/></IconBtn>
-        <IconBtn tip={`Fit page (${sc('fit')})`} disabled={!pdf} onClick={fitPage}><Maximize size={17}/></IconBtn>
+        <IconBtn tip={`Fit page (${sc('fit')})`} disabled={!pdf} onClick={()=>fitPage()}><Maximize size={17}/></IconBtn>
       </div></div>
       {MODULES.length>1&&<div className="hvac-group"><span className="hvac-group-label">Module</span><div className="hvac-group-items">
         <div className="hvac-switch" role="tablist" aria-label="Calculation module">
@@ -1021,7 +1144,7 @@ export default function App(){
       <div className="hvac-group"><span className="hvac-group-label">Output</span><div className="hvac-group-items">
         <IconBtn tip={`Room table (${sc('table')})`} active={settings.table.open} onClick={()=>runAction('table')}><LayoutList size={17}/></IconBtn>
         <IconBtn tip="Reports" active={reportsOpen} onClick={()=>{setReportsInitial(undefined);setReportsOpen(true);}}><ClipboardList size={17}/></IconBtn>
-        <IconBtn tip="Export all room data to CSV" disabled={!rooms.length} onClick={exportCsv}><Download size={17}/></IconBtn>
+        <IconBtn tip="Export all room data (every sheet) to CSV" disabled={!allSheets().some(sh=>sh.rooms.length)} onClick={exportCsv}><Download size={17}/></IconBtn>
       </div></div>
       <div className="hvac-spacer"/>
       <div className="hvac-group hvac-group-end"><span className="hvac-group-label">App</span><div className="hvac-group-items">
@@ -1045,8 +1168,13 @@ export default function App(){
           return <div className="hvac-totals"><div className="hvac-row"><span>Total net area</span><strong>{fmt(tot)} SF</strong></div><div className="hvac-row"><span>Required OA (ΣV<sub>oz</sub>)</span><strong>{fmt(oa)} cfm</strong></div><div className="hvac-row"><span>Provided OA</span><strong className={prov<oa-0.05?'hvac-bad-text':undefined}>{fmt(prov)} cfm</strong></div></div>;})()}
       </SidePanel>
       <div className="hvac-center">
+      {sheets.length>0&&<div className="es-sheets" role="tablist" aria-label="Sheets">
+        {sheets.map(sh=>{const n=sh.id===activeSheetId?rooms.length:sh.rooms.length;return <button key={sh.id} role="tab" aria-selected={sh.id===activeSheetId} className={`es-sheet${sh.id===activeSheetId?' on':''}`}
+          title={`${sh.name} · ${n} room${n===1?'':'s'} — double-click to rename`} onClick={()=>switchSheet(sh.id)} onDoubleClick={()=>renameSheet(sh.id)}>{sh.name}{n>0&&<span className="es-sheet-count">{n}</span>}</button>;})}
+        <button className="es-sheet es-sheet-add" title="Add sheets from a PDF" aria-label="Add sheets from a PDF" onClick={()=>fileRef.current?.click()}><Plus size={14}/></button>
+      </div>}
       <main ref={scrollRef} className={`hvac-main${spaceHeld?' pan-ready':''}${panning?' panning':''}`} onWheel={onWheel} onPointerDownCapture={onPanDown} onPointerMoveCapture={onPanMove} onPointerUpCapture={endPan} onPointerCancelCapture={endPan} onAuxClick={e=>e.preventDefault()}>
-        {!pdf?<div className="hvac-empty"><FileText size={54} strokeWidth={1.3}/><strong>Start with a floor plan</strong><span>Import a PDF, choose its scale, then trace inside wall faces.</span><button className="hvac-btn primary" onClick={()=>fileRef.current?.click()}>Choose PDF</button></div>:
+        {!pdf?<div className="hvac-empty"><FileText size={54} strokeWidth={1.3}/><strong>{sheets.length?'This sheet has no drawing':'Start with a floor plan'}</strong><span>{sheets.length?"Use Replace PDF to give it a background, or pick another sheet.":"Add a PDF: each page you pick becomes a sheet. Choose its scale, then trace inside wall faces."}</span><button className="hvac-btn primary" onClick={()=>(sheets.length?replaceRef:fileRef).current?.click()}>{sheets.length?'Choose PDF':'Add PDF'}</button></div>:
           <div ref={sheetRef} className="hvac-sheet" style={{width:0,height:0,boxShadow:"none",background:"transparent"}}>
             <div ref={worldRef} className="hvac-world" style={{width:pageSize.width,height:pageSize.height,transform:`translate3d(${offsetRef.current.x}px, ${offsetRef.current.y}px, 0) scale(${zoomRef.current})`,transformOrigin:"0 0",background:"white",boxShadow:"0 6px 26px #64748b35"}}>
               <canvas ref={canvasRef} style={{opacity:settings.pdfOpacity}}/>
@@ -1133,7 +1261,16 @@ export default function App(){
       <SidePanel side="right" title="Properties" open={settings.rightOpen} onToggle={()=>setSettings(st=>({...st,rightOpen:!st.rightOpen}))}>
         <Section title="Drawing" open={secOpen('drawing')} onToggle={()=>toggleSec('drawing')} aside={scale==='custom'?(feetPerPoint?'calibrated':'not calibrated'):scales.find(x=>x[0]===scale)?.[1]}>
           <div className="hvac-row"><span>Scale</span><strong>{scale==='custom'?(feetPerPoint?`${fmt(1/feetPerPoint)} pts / ft`:'Not calibrated'):scales.find(x=>x[0]===scale)?.[1]}</strong></div>
-          {pdf&&pdf.numPages>1&&<div className="hvac-row"><span>PDF page</span><select value={pageNumber} onChange={e=>{const next=Number(e.target.value);e.currentTarget.blur();if(next===pageNumber)return;if(rooms.length&&!window.confirm('Switching PDF pages currently clears room takeoffs. Save your project first. Continue?'))return;setPageNumber(next);setRooms([]);setDraft([]);setSelectedId(null);}}>{Array.from({length:pdf.numPages},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></div>}
+          {activeSheetId&&(()=>{const i=sheets.findIndex(x=>x.id===activeSheetId),sh=sheets[i];return <>
+            <div className="hvac-row"><span>Sheet</span><strong>{sh?.name}</strong></div>
+            {pdf&&<div className="hvac-row"><span>PDF page</span><strong>{pageNumber} of {pdf.numPages}</strong></div>}
+            <div className="es-sheet-actions">
+              <button className="hvac-btn" onClick={()=>renameSheet(activeSheetId)}><Pencil size={14}/> Rename</button>
+              <button className="hvac-btn" title="Move sheet left" disabled={i<=0} onClick={()=>moveSheet(activeSheetId,-1)}>◀</button>
+              <button className="hvac-btn" title="Move sheet right" disabled={i>=sheets.length-1} onClick={()=>moveSheet(activeSheetId,1)}>▶</button>
+              {pdf&&pdf.numPages>1&&<button className="hvac-btn" title="Add more pages of this PDF as sheets" onClick={addPagesOfCurrentPdf}><Plus size={14}/> Pages</button>}
+              <button className="hvac-btn" title="Remove this sheet" aria-label="Remove this sheet" onClick={()=>removeSheet(activeSheetId)}><Trash2 size={14}/></button>
+            </div></>;})()}
           {selected&&selIds.length<=1&&<>
             <div className="hvac-subhead">{selected.name}</div>
             <div className="hvac-field"><label>Label size (pt)</label><div className="hvac-inline"><NumField value={selected.labelSize??DEFAULT_LABEL_SIZE} min={2} onChange={v=>updateRoom({labelSize:Math.min(72,v)})}/>
@@ -1212,8 +1349,8 @@ export default function App(){
         :<PlumbingLibrary types={fixtureTypes} setTypes={setFixtureTypes} usage={fixUsage} onDeleteType={deleteFixtureType}
           selectedRoom={selected&&selIds.length<=1?selected.name:null} onAddToRoom={id=>{if(selected)addFixtureTo(selected,id);}}/>}
     </Libraries>}
-    {reportsOpen&&<Reports rooms={rooms} feetPerPoint={feetPerPoint} env={env} projectName={projectName} saved={settings.reports}
-      setSaved={next=>setSettings(st=>({...st,reports:next}))} templateName={templateName} initialId={reportsInitial} onClose={()=>setReportsOpen(false)}/>}
+    {reportsOpen&&(()=>{const list=allSheets(),fpp=new Map(list.flatMap(sh=>sh.rooms.map(r=>[r.id,sheetFeetPerPoint(sh)] as const)));return <Reports rooms={list.flatMap(sh=>sh.rooms)} feetPerPoint={feetPerPoint} feetPerPointOf={r=>fpp.get(r.id)??feetPerPoint} env={env} projectName={projectName} saved={settings.reports}
+      setSaved={next=>setSettings(st=>({...st,reports:next}))} templateName={templateName} initialId={reportsInitial} onClose={()=>setReportsOpen(false)}/>;})()}
     {settingsOpen&&<div className="hvac-modal-backdrop" onPointerDown={e=>{if(e.target===e.currentTarget){setSettingsOpen(false);setCapturing(null);}}}>
       <div className="hvac-modal" role="dialog" aria-label="Settings">
         <header><strong>Settings</strong><IconBtn tip="Close (Esc)" onClick={()=>{setSettingsOpen(false);setCapturing(null);}}><X size={17}/></IconBtn></header>

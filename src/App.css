@@ -404,3 +404,14 @@
 .hvac-seg button.on{background:#1d4ed8;border-color:#1d4ed8;color:white}
 .hvac-report-table td.span{vertical-align:top;background:#fbfcfe}
 .hvac-report-table tr.grp-cont td{border-top-color:#eef2f7}
+
+/* ---- Engineering Studio: sheet tabs (above the drawing) ---- */
+.es-sheets{display:flex;align-items:flex-end;gap:2px;padding:6px 8px 0;background:#dfe6ef;border-bottom:1px solid #cbd5e1;overflow-x:auto;flex-shrink:0;scrollbar-width:thin}
+.es-sheet{display:inline-flex;align-items:center;gap:6px;max-width:220px;padding:6px 12px;border:1px solid #cbd5e1;border-bottom:none;border-radius:7px 7px 0 0;background:#eef2f7;color:#475569;font:inherit;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;margin-bottom:-1px}
+.es-sheet:hover{background:#f8fafc;color:#0f172a}
+.es-sheet.on{background:white;color:#0f172a;font-weight:600;border-color:#94a3b8;border-bottom:1px solid white;position:relative;z-index:1}
+.es-sheet-count{font-size:10px;font-weight:600;color:#64748b;background:#e2e8f0;border-radius:8px;padding:0 6px}
+.es-sheet.on .es-sheet-count{background:#dbeafe;color:#1d4ed8}
+.es-sheet-add{padding:6px 9px;color:#2563eb}
+.es-sheet-actions{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
+.es-sheet-actions .hvac-btn{display:inline-flex;align-items:center;gap:4px}
